@@ -1,0 +1,428 @@
+#!/usr/bin/perl -w
+#
+# mcpst-compare
+# John Simpson <jms1@jms1.net> 2022-04-05
+#
+# Compare the contents of two or more Elektron Model:Cycles MCPST files.
+
+require 5.005 ;
+use strict ;
+
+use File::Temp qw ( tempdir ) ;
+use Getopt::Std ;
+use JSON ;
+
+########################################
+# Other global variables
+
+my @files       = () ;      # filenames (in original order)
+my $f1          = '' ;      # name of first file (makes logic easier)
+my %contents    = () ;      # filename => binary blob contents
+my $fwidth      = 11 ;      # width of each file's column, min 11
+
+my %opt         = () ;      # getopts
+my $do_debug    = 0 ;       # -d
+
+###############################################################################
+
+sub usage(;$)
+{
+    my $msg = ( shift || '' ) ;
+
+    print <<EOF ;
+$0 [options] input.mcpst [...]
+
+Compare the contents of two or more Elektron Model:Cycles MCPST files.
+
+-d      Enable debugging messages.
+
+-h      Show this help message.
+
+EOF
+
+    if ( $msg ne '' )
+    {
+        print $msg ;
+        exit 1 ;
+    }
+
+    exit 0 ;
+}
+
+###############################################################################
+#
+# Debugging
+
+sub debug(@)
+{
+    $do_debug && print @_ ;
+}
+
+###############################################################################
+#
+# Convert a sequence of bytes to series of hex numbers
+
+sub str2hex($)
+{
+    my $x = shift ;
+    return join( ' ' , map{ sprintf('%02x',ord($_)) } split( // , $x ) ) ;
+}
+
+###############################################################################
+#
+# Read a '.mcpst' file (ZIP file) into memory
+
+sub read_mcpst($)
+{
+    my $infile = shift ;
+
+    ########################################
+    # Create work dir
+
+    my $workdir = tempdir( CLEANUP => 1 )
+        or die "ERROR: tempdir(): $!\n" ;
+    debug "[$infile] \$workdir='$workdir'\n" ;
+
+    ########################################
+    # Unzip the file
+
+    my $cmd = "unzip -d '$workdir' '$infile'" ;
+
+    if ( $do_debug )
+    {
+        print "[$infile] \$cmd='$cmd'\n" ;
+        system $cmd ;
+    }
+    else
+    {
+        system "$cmd >/dev/null 2>&1" ;
+    }
+
+    ########################################
+    # Read 'manifest.json'
+
+    open( I , '<' , "$workdir/manifest.json" )
+        or die "ERROR: can't read $workdir/manifest.json: $!\n" ;
+
+    my $jt = '' ;
+    while ( my $line = <I> )
+    {
+        $jt .= $line ;
+    }
+    close I ;
+
+    debug "[$infile] \$jt='$jt'\n" ;
+
+    ########################################
+    # Parse the JSON
+
+    my $rj = decode_json( $jt ) ;
+
+    ########################################
+    # Make sure the expected elements are present
+
+    my $fv = ( $rj->{'FormatVersion'} || '' ) ;
+    unless ( $fv eq '1.0' )
+    {
+        die "ERROR: [$infile] manifest.json contains unrecognized FormatVersion '$fv' (expecting '1.0')\n" ;
+    }
+
+    my $ft = ( $rj->{'FileType'} || '' ) ;
+    unless ( $ft eq 'Sound' )
+    {
+        die "ERROR: [$infile] manifest.json contains unrecognized FileType '$ft' (expecting 'Sound')\n" ;
+    }
+
+    my @pt = @{$rj->{'ProductType'}} ;
+    my $has_27 = 0 ;
+    for my $t ( @pt )
+    {
+        if ( $t eq '27' )
+        {
+            $has_27 = 1 ;
+            last ;
+        }
+    }
+
+    unless ( $has_27 )
+    {
+        die "ERROR: [$infile] manifest.json ProductType list does not contain '27'\n" ;
+    }
+
+    my $payload = ( $rj->{'Payload'} || die "ERROR: [$infile] manifest.json does not contain a Payload element\n" ) ;
+
+    ########################################
+    # Build the name of the binary file
+    # and make sure it exists
+
+    my $binfile = "$workdir/$payload" ;
+
+    unless ( -f $binfile )
+    {
+        die "ERROR: [$infile] '$binfile' does not exist\n" ;
+    }
+
+    ########################################
+    # Read the binary file into memory
+
+    open( I , '<' , $binfile )
+        or die "ERROR: [$infile] can't read '$binfile': $!\n" ;
+    binmode I ;
+
+    my $bin = '' ;
+    my $rb = read( I , $bin , 1048576 ) ;
+    if ( $rb < 1 )
+    {
+        die "ERROR: [$infile] read() returned $rb: $!\n" ;
+    }
+    close I ;
+
+    if ( $rb != 160 )
+    {
+        print "WARNING: [$infile] payload is $rb bytes, not 160\n" ;
+    }
+
+    ########################################
+    # Return the contents
+
+    return $bin ;
+}
+
+###############################################################################
+#
+# Classify an offset which needs to be highlighted
+#
+# Parameters:
+# - offset (0-159, or 0x00-0x9F) to be classified
+# - 0 if value is the same across all files, 1 if any files are different
+#
+# Returns:
+# - a printf() format string containing '%02x'
+
+my $fmt_same    = '%02x' ;                      # same across all files
+my $fmt_name    = "\033[0;30;46m%02x\033[0m" ;  # name - not comparing
+my $fmt_known   = "\033[0;30;42m%02x\033[0m" ;  # different, purpose is known
+my $fmt_unknown = "\033[0;30;43m%02x\033[0m" ;  # different, purpose not known
+
+sub classify($$)
+{
+    my $n    = shift ;
+    my $diff = shift ;
+
+    ########################################
+    # 3c-47: Preset name - always highlight whether different or not
+
+    if ( ( $n >= 0x3c ) && ( $n <= 0x47 ) )
+    {
+        return $fmt_name ;
+    }
+
+    ########################################
+    # If the value is the same across all files, no need to highlight
+
+    $diff || return $fmt_same ;
+
+    ########################################
+    # 5e: Machine type (kick, snare, tone, chord, etc.)
+
+    if ( $n == 0x5e )
+    {
+        return $fmt_known ;
+    }
+
+    ########################################
+    # 60-61: Pitch
+
+    if ( ( $n == 0x60 ) || ( $n == 0x61 ) )
+    {
+        return $fmt_known ;
+    }
+
+    ########################################
+    # 62: Color
+
+    if ( $n == 0x62 )
+    {
+        return $fmt_known ;
+    }
+
+    ########################################
+    # 64: Shape
+
+    if ( $n == 0x64 )
+    {
+        return $fmt_known ;
+    }
+
+    ########################################
+    # 66: Sweep
+
+    if ( $n == 0x66 )
+    {
+        return $fmt_known ;
+    }
+
+    ########################################
+    # 68: Contour
+
+    if ( $n == 0x68 )
+    {
+        return $fmt_known ;
+    }
+
+    ########################################
+    # 72: Decay
+
+    if ( $n == 0x72 )
+    {
+        return $fmt_known ;
+    }
+
+    ########################################
+    # 76: Delay Send
+
+    if ( $n == 0x76 )
+    {
+        return $fmt_known ;
+    }
+
+    ########################################
+    # 78: Reverb Send
+
+    if ( $n == 0x78 )
+    {
+        return $fmt_known ;
+    }
+
+    ########################################
+    # Reverb Size
+    # TODO
+
+    ########################################
+    # Reverb Tone
+    
+
+
+    ########################################
+    # Anything else - not known
+
+    return $fmt_unknown ;
+}
+
+###############################################################################
+###############################################################################
+###############################################################################
+#
+# Parse the command line
+
+getopts( 'hd' , \%opt ) ;
+$opt{'h'} && usage() ;
+$do_debug   = ( $opt{'d'} ? 1 : 0 ) ;
+
+########################################
+# Read the input files into memory
+
+my $arg = ( shift @ARGV || usage() ) ;
+while ( $arg ne '' )
+{
+    if ( $f1 eq '' )
+    {
+        $f1 = $arg ;
+    }
+
+    if ( length( $arg ) > $fwidth )
+    {
+        $fwidth = length( $arg ) ;
+    }
+
+    my $text = read_mcpst( $arg ) ;
+    push( @files , $arg ) ;
+    $contents{$arg} = $text ;
+
+    $arg = ( shift @ARGV || '' ) ;
+}
+
+###############################################################################
+#
+# Show the comparison between the files
+
+########################################
+# Print headers
+
+print 'offset  ' ;
+map { printf ' | %-*s' , $fwidth , $_ } @files ;
+print "\n" ;
+
+print '--------' ;
+map { print '-+-' , '-' x $fwidth } @files ;
+print "\n" ;
+
+########################################
+# For each range of four bytes, print all files' contents of that byte range
+
+my $pos = 0 ;
+
+while ( $pos < 160 )
+{
+    printf '%08x' , $pos ;
+
+    ########################################
+    # Figure out what printf() format to use for printing each position.
+    # - no highlight    value is the same across all files
+    # - green           value differs, position's purpose is known
+    # - yellow          value differs, position's purpose is not known
+    # (see @known_loc to set which offsets are known)
+
+    my @fmt = () ;      # format string for each spot (0-3)
+
+    for my $n ( 0 .. 3 )
+    {
+        $fmt[$n] = $fmt_same ;
+
+        my $diff = 0 ;
+        my $fv   = '' ;
+
+        for my $f ( @files )
+        {
+            my $c = sprintf( '%02x' , ord( substr( $contents{$f} , $pos+$n , 1 ) ) ) ;
+
+            if ( $fv eq '' )
+            {
+                $fv = $c ;
+                next ;
+            }
+            elsif ( $c ne $fv )
+            {
+                $diff = 1 ;
+                last ;
+            }
+        }
+
+        $fmt[$n] = classify( $pos+$n , $diff ) ;
+    }
+
+    ########################################
+    # Print each file's contents for these four bytes
+
+    for my $f ( @files )
+    {
+        print ' | ' ;
+
+        for my $n ( 0 .. 3 )
+        {
+            $n && print ' ' ;
+            my $c = ord( substr( $contents{$f} , $pos + $n , 1 ) ) ;
+
+            printf $fmt[$n] , $c ;
+        }
+
+        print ' ' x ( $fwidth - 11 ) ;
+    }
+
+    ########################################
+    # next line
+
+    print "\n" ;
+
+    $pos += 4 ;
+}
