@@ -2,7 +2,9 @@
 
 This repo contains information I've figured out while reverse-engineering the format of the `.mcpst` files created by the [Elektron Model:Cycles](https://www.elektron.se/products/modelcycles/). These files contain "Presets", which are collections of settings which are used to configure what kinds of sound the Model:Cycles FM synthesizers produce.
 
-It also contains a couple of scripts I wrote while figuring out the file format.
+The `docs/` directory contains the actual documentation I've written.
+
+The `scripts/` directory contains a couple of scripts I wrote while figuring out the file format.
 
 * **`mcpst-dump`** is the script I had originally envisioned, which reads an `.mcpst` file and prints the values of the various parameters stored in the Preset it contains.
 
